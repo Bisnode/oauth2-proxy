@@ -94,6 +94,7 @@ type OAuthProxy struct {
 	PassUserHeaders         bool
 	BasicAuthPassword       string
 	PassAccessToken         bool
+	PassAccessTokenAsBearer bool
 	SetAuthorization        bool
 	PassAuthorization       bool
 	PreferEmailToUser       bool
@@ -212,6 +213,7 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		PassUserHeaders:         opts.PassUserHeaders,
 		BasicAuthPassword:       opts.BasicAuthPassword,
 		PassAccessToken:         opts.PassAccessToken,
+		PassAccessTokenAsBearer: opts.PassAccessTokenAsBearer,
 		SetAuthorization:        opts.SetAuthorization,
 		PassAuthorization:       opts.PassAuthorization,
 		PreferEmailToUser:       opts.PreferEmailToUser,
@@ -1037,10 +1039,18 @@ func (p *OAuthProxy) addHeadersForProxying(rw http.ResponseWriter, req *http.Req
 	}
 
 	if p.PassAccessToken {
-		if session.AccessToken != "" {
-			req.Header["X-Forwarded-Access-Token"] = []string{session.AccessToken}
+		if p.PassAccessTokenAsBearer {
+			if session.AccessToken != "" {
+				req.Header["Authorization"] = []string{fmt.Sprintf("Bearer %s", session.AccessToken)}
+			} else {
+				req.Header.Del("Authorization")
+			}
 		} else {
-			req.Header.Del("X-Forwarded-Access-Token")
+			if session.AccessToken != "" {
+				req.Header["X-Forwarded-Access-Token"] = []string{session.AccessToken}
+			} else {
+				req.Header.Del("X-Forwarded-Access-Token")
+			}
 		}
 	}
 

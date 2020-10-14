@@ -75,6 +75,7 @@ type Options struct {
 	PreferEmailToUser     bool     `flag:"prefer-email-to-user" cfg:"prefer_email_to_user"`
 	BasicAuthPassword     string   `flag:"basic-auth-password" cfg:"basic_auth_password"`
 	PassAccessToken       bool     `flag:"pass-access-token" cfg:"pass_access_token"`
+	PassAccessTokenAsBearer bool     `flag:"pass-access-token-as-bearer" cfg:"pass_access_token_as_bearer"`
 	SkipProviderButton    bool     `flag:"skip-provider-button" cfg:"skip_provider_button"`
 	PassUserHeaders       bool     `flag:"pass-user-headers" cfg:"pass_user_headers"`
 	SSLInsecureSkipVerify bool     `flag:"ssl-insecure-skip-verify" cfg:"ssl_insecure_skip_verify"`
@@ -157,6 +158,7 @@ func NewOptions() *Options {
 		SetBasicAuth:                     false,
 		PassUserHeaders:                  true,
 		PassAccessToken:                  false,
+		PassAccessTokenAsBearer:          false,
 		SetAuthorization:                 false,
 		PassAuthorization:                false,
 		PreferEmailToUser:                false,
@@ -190,6 +192,7 @@ func NewFlagSet() *pflag.FlagSet {
 	flagSet.Bool("pass-user-headers", true, "pass X-Forwarded-User and X-Forwarded-Email information to upstream")
 	flagSet.String("basic-auth-password", "", "the password to set when passing the HTTP Basic Auth header")
 	flagSet.Bool("pass-access-token", false, "pass OAuth access_token to upstream via X-Forwarded-Access-Token header")
+	flagSet.Bool("pass-access-token-as-bearer", false, "pass OAuth access_token to upstream via Authorization header")
 	flagSet.Bool("pass-authorization-header", false, "pass the Authorization Header to upstream")
 	flagSet.Bool("set-authorization-header", false, "set Authorization response headers (useful in Nginx auth_request mode)")
 	flagSet.StringSlice("skip-auth-regex", []string{}, "(DEPRECATED for --skip-auth-route) bypass authentication for requests path's that match (may be given multiple times)")
