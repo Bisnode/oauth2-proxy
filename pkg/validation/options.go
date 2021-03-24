@@ -2,7 +2,6 @@ package validation
 
 import (
 	"context"
-	"crypto"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
@@ -28,6 +27,10 @@ func Validate(o *options.Options) error {
 	msgs := validateCookie(o.Cookie)
 	msgs = append(msgs, validateSessionCookieMinimal(o)...)
 	msgs = append(msgs, validateRedisSessionStore(o)...)
+	msgs = append(msgs, prefixValues("injectRequestHeaders: ", validateHeaders(o.InjectRequestHeaders)...)...)
+	msgs = append(msgs, prefixValues("injectResponseHeaders: ", validateHeaders(o.InjectResponseHeaders)...)...)
+	msgs = configureLogger(o.Logging, msgs)
+	msgs = parseSignatureKey(o, msgs)
 
 	if o.SSLInsecureSkipVerify {
 		// InsecureSkipVerify is a configurable option we allow
@@ -39,10 +42,10 @@ func Validate(o *options.Options) error {
 	} else if len(o.ProviderCAFiles) > 0 {
 		pool, err := util.GetCertPool(o.ProviderCAFiles)
 		if err == nil {
-			transport := &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs: pool,
-				},
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			transport.TLSClientConfig = &tls.Config{
+				RootCAs:    pool,
+				MinVersion: tls.VersionTLS12,
 			}
 
 			http.DefaultClient = &http.Client{Transport: transport}
@@ -69,10 +72,6 @@ func Validate(o *options.Options) error {
 	if o.AuthenticatedEmailsFile == "" && len(o.EmailDomains) == 0 && o.HtpasswdFile == "" {
 		msgs = append(msgs, "missing setting for email validation: email-domain or authenticated-emails-file required."+
 			"\n      use email-domain=* to authorize all email addresses")
-	}
-
-	if o.SetBasicAuth && o.SetAuthorization {
-		msgs = append(msgs, "mutually exclusive: set-basic-auth and set-authorization-header can not both be true")
 	}
 
 	if o.OIDCIssuerURL != "" {
@@ -159,10 +158,6 @@ func Validate(o *options.Options) error {
 		}
 	}
 
-	if o.PreferEmailToUser && !o.PassBasicAuth && !o.PassUserHeaders {
-		msgs = append(msgs, "PreferEmailToUser should only be used with PassBasicAuth or PassUserHeaders")
-	}
-
 	if o.SkipJwtBearerTokens {
 		// Configure extra issuers
 		if len(o.ExtraJwtIssuers) > 0 {
@@ -181,6 +176,9 @@ func Validate(o *options.Options) error {
 	var redirectURL *url.URL
 	redirectURL, msgs = parseURL(o.RawRedirectURL, "redirect", msgs)
 	o.SetRedirectURL(redirectURL)
+	if o.RawRedirectURL == "" && !o.Cookie.Secure && !o.ReverseProxy {
+		logger.Print("WARNING: no explicit redirect URL: redirects will default to insecure HTTP")
+	}
 
 	msgs = append(msgs, validateUpstreams(o.UpstreamServers)...)
 	msgs = parseProviderInfo(o, msgs)
@@ -196,9 +194,6 @@ func Validate(o *options.Options) error {
 			msgs = append(msgs, "missing setting: google-service-account-json")
 		}
 	}
-
-	msgs = parseSignatureKey(o, msgs)
-	msgs = configureLogger(o.Logging, msgs)
 
 	if o.ReverseProxy {
 		parser, err := ip.GetRealClientIPParser(o.RealClientIPHeader)
@@ -239,7 +234,28 @@ func parseProviderInfo(o *options.Options, msgs []string) []string {
 	p.ValidateURL, msgs = parseURL(o.ValidateURL, "validate", msgs)
 	p.ProtectedResource, msgs = parseURL(o.ProtectedResource, "resource", msgs)
 
-	o.SetProvider(providers.New(o.ProviderType, p))
+	// Make the OIDC options available to all providers that support it
+	p.AllowUnverifiedEmail = o.InsecureOIDCAllowUnverifiedEmail
+	p.EmailClaim = o.OIDCEmailClaim
+	p.GroupsClaim = o.OIDCGroupsClaim
+	p.Verifier = o.GetOIDCVerifier()
+
+	// TODO (@NickMeves) - Remove This
+	// Backwards Compatibility for Deprecated UserIDClaim option
+	if o.OIDCEmailClaim == providers.OIDCEmailClaim &&
+		o.UserIDClaim != providers.OIDCEmailClaim {
+		p.EmailClaim = o.UserIDClaim
+	}
+
+	p.SetAllowedGroups(o.AllowedGroups)
+
+	provider := providers.New(o.ProviderType, p)
+	if provider == nil {
+		msgs = append(msgs, fmt.Sprintf("invalid setting: provider '%s' is not available", o.ProviderType))
+		return msgs
+	}
+	o.SetProvider(provider)
+
 	switch p := o.GetProvider().(type) {
 	case *providers.AzureProvider:
 		p.Configure(o.AzureTenant)
@@ -248,36 +264,42 @@ func parseProviderInfo(o *options.Options, msgs []string) []string {
 		p.SetRepo(o.GitHubRepo, o.GitHubToken)
 		p.SetUsers(o.GitHubUsers)
 	case *providers.KeycloakProvider:
-		p.SetGroup(o.KeycloakGroup)
+		// Backwards compatibility with `--keycloak-group` option
+		if len(o.KeycloakGroups) > 0 {
+			p.SetAllowedGroups(o.KeycloakGroups)
+		}
 	case *providers.GoogleProvider:
 		if o.GoogleServiceAccountJSON != "" {
 			file, err := os.Open(o.GoogleServiceAccountJSON)
 			if err != nil {
 				msgs = append(msgs, "invalid Google credentials file: "+o.GoogleServiceAccountJSON)
 			} else {
-				p.SetGroupRestriction(o.GoogleGroups, o.GoogleAdminEmail, file)
+				groups := o.AllowedGroups
+				// Backwards compatibility with `--google-group` option
+				if len(o.GoogleGroups) > 0 {
+					groups = o.GoogleGroups
+					p.SetAllowedGroups(groups)
+				}
+				p.SetGroupRestriction(groups, o.GoogleAdminEmail, file)
 			}
 		}
 	case *providers.BitbucketProvider:
 		p.SetTeam(o.BitbucketTeam)
 		p.SetRepository(o.BitbucketRepository)
 	case *providers.OIDCProvider:
-		p.AllowUnverifiedEmail = o.InsecureOIDCAllowUnverifiedEmail
-		p.UserIDClaim = o.UserIDClaim
-		p.GroupsClaim = o.OIDCGroupsClaim
-		if o.GetOIDCVerifier() == nil {
+		if p.Verifier == nil {
 			msgs = append(msgs, "oidc provider requires an oidc issuer URL")
-		} else {
-			p.Verifier = o.GetOIDCVerifier()
 		}
 	case *providers.GitLabProvider:
-		p.AllowUnverifiedEmail = o.InsecureOIDCAllowUnverifiedEmail
 		p.Groups = o.GitLabGroup
-		p.EmailDomains = o.EmailDomains
+		err := p.AddProjects(o.GitlabProjects)
+		if err != nil {
+			msgs = append(msgs, "failed to setup gitlab project access level")
+		}
+		p.SetAllowedGroups(p.PrefixAllowedGroups())
+		p.SetProjectScope()
 
-		if o.GetOIDCVerifier() != nil {
-			p.Verifier = o.GetOIDCVerifier()
-		} else {
+		if p.Verifier == nil {
 			// Initialize with default verifier for gitlab.com
 			ctx := context.Background()
 
@@ -332,6 +354,8 @@ func parseSignatureKey(o *options.Options, msgs []string) []string {
 		return msgs
 	}
 
+	logger.Print("WARNING: `--signature-key` is deprecated. It will be removed in a future release")
+
 	components := strings.Split(o.SignatureKey, ":")
 	if len(components) != 2 {
 		return append(msgs, "invalid signature hash:key spec: "+
@@ -339,11 +363,9 @@ func parseSignatureKey(o *options.Options, msgs []string) []string {
 	}
 
 	algorithm, secretKey := components[0], components[1]
-	var hash crypto.Hash
-	var err error
-	if hash, err = hmacauth.DigestNameToCryptoHash(algorithm); err != nil {
-		return append(msgs, "unsupported signature hash algorithm: "+
-			o.SignatureKey)
+	hash, err := hmacauth.DigestNameToCryptoHash(algorithm)
+	if err != nil {
+		return append(msgs, "unsupported signature hash algorithm: "+o.SignatureKey)
 	}
 	o.SetSignatureData(&options.SignatureData{Hash: hash, Key: secretKey})
 	return msgs

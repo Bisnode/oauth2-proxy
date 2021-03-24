@@ -104,8 +104,7 @@ var _ = Describe("Stored Session Suite", func() {
 				// Set up the request with the request headesr and a request scope
 				req := httptest.NewRequest("", "/", nil)
 				req.Header = in.requestHeaders
-				contextWithScope := context.WithValue(req.Context(), requestScopeKey, scope)
-				req = req.WithContext(contextWithScope)
+				req = middlewareapi.AddRequestScope(req, scope)
 
 				rw := httptest.NewRecorder()
 
@@ -120,7 +119,7 @@ var _ = Describe("Stored Session Suite", func() {
 				// from the scope
 				var gotSession *sessionsapi.SessionState
 				handler := NewStoredSessionLoader(opts)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					gotSession = r.Context().Value(requestScopeKey).(*middlewareapi.RequestScope).Session
+					gotSession = middlewareapi.GetRequestScope(r).Session
 				}))
 				handler.ServeHTTP(rw, req)
 
@@ -402,6 +401,7 @@ var _ = Describe("Stored Session Suite", func() {
 				}
 
 				req := httptest.NewRequest("", "/", nil)
+				req = middlewareapi.AddRequestScope(req, &middlewareapi.RequestScope{})
 				refreshed, err := s.refreshSessionWithProvider(nil, req, in.session)
 				if in.expectedErr != nil {
 					Expect(err).To(MatchError(in.expectedErr))

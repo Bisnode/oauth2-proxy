@@ -19,6 +19,7 @@ import (
 
 	"github.com/coreos/go-oidc"
 	"github.com/mbland/hmacauth"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
@@ -56,7 +57,7 @@ func TestRobotsTxt(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/robots.txt", nil)
 	proxy.ServeHTTP(rw, req)
 	assert.Equal(t, 200, rw.Code)
-	assert.Equal(t, "User-agent: *\nDisallow: /", rw.Body.String())
+	assert.Equal(t, "User-agent: *\nDisallow: /\n", rw.Body.String())
 }
 
 func TestIsValidRedirect(t *testing.T) {
@@ -297,6 +298,11 @@ func TestIsValidRedirect(t *testing.T) {
 			Redirect:       "/\t/\t\\evil.com",
 			ExpectedResult: false,
 		},
+		{
+			Desc:           "openRedirectPartialSubdomain",
+			Redirect:       "http://evilbar.foo",
+			ExpectedResult: false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -396,12 +402,85 @@ func NewTestProvider(providerURL *url.URL, emailAddress string) *TestProvider {
 	}
 }
 
-func (tp *TestProvider) GetEmailAddress(ctx context.Context, session *sessions.SessionState) (string, error) {
+func (tp *TestProvider) GetEmailAddress(_ context.Context, _ *sessions.SessionState) (string, error) {
 	return tp.EmailAddress, nil
 }
 
-func (tp *TestProvider) ValidateSessionState(ctx context.Context, session *sessions.SessionState) bool {
+func (tp *TestProvider) ValidateSession(_ context.Context, _ *sessions.SessionState) bool {
 	return tp.ValidToken
+}
+
+func Test_redeemCode(t *testing.T) {
+	opts := baseTestOptions()
+	err := validation.Validate(opts)
+	assert.NoError(t, err)
+
+	proxy, err := NewOAuthProxy(opts, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	_, err = proxy.redeemCode(req)
+	assert.Equal(t, providers.ErrMissingCode, err)
+}
+
+func Test_enrichSession(t *testing.T) {
+	const (
+		sessionUser   = "Mr Session"
+		sessionEmail  = "session@example.com"
+		providerEmail = "provider@example.com"
+	)
+
+	testCases := map[string]struct {
+		session       *sessions.SessionState
+		expectedUser  string
+		expectedEmail string
+	}{
+		"Session already has enrichable fields": {
+			session: &sessions.SessionState{
+				User:  sessionUser,
+				Email: sessionEmail,
+			},
+			expectedUser:  sessionUser,
+			expectedEmail: sessionEmail,
+		},
+		"Session is missing Email and GetEmailAddress is implemented": {
+			session: &sessions.SessionState{
+				User: sessionUser,
+			},
+			expectedUser:  sessionUser,
+			expectedEmail: providerEmail,
+		},
+		"Session is missing User and GetUserName is not implemented": {
+			session: &sessions.SessionState{
+				Email: sessionEmail,
+			},
+			expectedUser:  "",
+			expectedEmail: sessionEmail,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			opts := baseTestOptions()
+			err := validation.Validate(opts)
+			assert.NoError(t, err)
+
+			// intentionally set after validation.Validate(opts) since it will clobber
+			// our TestProvider and call `providers.New` defaulting to `providers.GoogleProvider`
+			opts.SetProvider(NewTestProvider(&url.URL{Host: "www.example.com"}, providerEmail))
+			proxy, err := NewOAuthProxy(opts, func(string) bool { return true })
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = proxy.enrichSessionState(context.Background(), tc.session)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedUser, tc.session.User)
+			assert.Equal(t, tc.expectedEmail, tc.session.Email)
+		})
+	}
 }
 
 func TestBasicAuthPassword(t *testing.T) {
@@ -423,6 +502,8 @@ func TestBasicAuthPassword(t *testing.T) {
 			t.Fatal(err)
 		}
 	}))
+
+	basicAuthPassword := "This is a secure password"
 	opts := baseTestOptions()
 	opts.UpstreamServers = options.Upstreams{
 		{
@@ -433,11 +514,22 @@ func TestBasicAuthPassword(t *testing.T) {
 	}
 
 	opts.Cookie.Secure = false
-	opts.PassBasicAuth = true
-	opts.SetBasicAuth = true
-	opts.PassUserHeaders = true
-	opts.PreferEmailToUser = true
-	opts.BasicAuthPassword = "This is a secure password"
+	opts.InjectRequestHeaders = []options.Header{
+		{
+			Name: "Authorization",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "email",
+						BasicAuthPassword: &options.SecretSource{
+							Value: []byte(basicAuthPassword),
+						},
+					},
+				},
+			},
+		},
+	}
+
 	err := validation.Validate(opts)
 	assert.NoError(t, err)
 
@@ -452,148 +544,44 @@ func TestBasicAuthPassword(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Save the required session
 	rw := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/oauth2/callback?code=callback_code&state=nonce:", strings.NewReader(""))
-	req.AddCookie(proxy.MakeCSRFCookie(req, "nonce", proxy.CookieExpire, time.Now()))
-	proxy.ServeHTTP(rw, req)
-	if rw.Code >= 400 {
-		t.Fatalf("expected 3xx got %d", rw.Code)
-	}
-	cookie := rw.Header().Values("Set-Cookie")[1]
-
-	cookieName := proxy.CookieName
-	var value string
-	keyPrefix := cookieName + "="
-
-	for _, field := range strings.Split(cookie, "; ") {
-		value = strings.TrimPrefix(field, keyPrefix)
-		if value != field {
-			break
-		} else {
-			value = ""
-		}
-	}
-
-	req, _ = http.NewRequest("GET", "/", strings.NewReader(""))
-	req.AddCookie(&http.Cookie{
-		Name:     cookieName,
-		Value:    value,
-		Path:     "/",
-		Expires:  time.Now().Add(time.Duration(24)),
-		HttpOnly: true,
+	req, _ := http.NewRequest("GET", "/", nil)
+	err = proxy.sessionStore.Save(rw, req, &sessions.SessionState{
+		Email: emailAddress,
 	})
-	req.AddCookie(proxy.MakeCSRFCookie(req, "nonce", proxy.CookieExpire, time.Now()))
+	assert.NoError(t, err)
 
+	// Extract the cookie value to inject into the test request
+	cookie := rw.Header().Values("Set-Cookie")[0]
+
+	req, _ = http.NewRequest("GET", "/", nil)
+	req.Header.Set("Cookie", cookie)
 	rw = httptest.NewRecorder()
 	proxy.ServeHTTP(rw, req)
 
 	// The username in the basic auth credentials is expected to be equal to the email address from the
 	// auth response, so we use the same variable here.
-	expectedHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(emailAddress+":"+opts.BasicAuthPassword))
+	expectedHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(emailAddress+":"+basicAuthPassword))
 	assert.Equal(t, expectedHeader, rw.Body.String())
 	providerServer.Close()
 }
 
-func TestBasicAuthWithEmail(t *testing.T) {
-	opts := baseTestOptions()
-	opts.PassBasicAuth = true
-	opts.PassUserHeaders = false
-	opts.PreferEmailToUser = false
-	opts.BasicAuthPassword = "This is a secure password"
-	err := validation.Validate(opts)
-	assert.NoError(t, err)
-
-	const emailAddress = "john.doe@example.com"
-	const userName = "9fcab5c9b889a557"
-
-	// The username in the basic auth credentials is expected to be equal to the email address from the
-	expectedEmailHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(emailAddress+":"+opts.BasicAuthPassword))
-	expectedUserHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(userName+":"+opts.BasicAuthPassword))
-
-	created := time.Now()
-	session := &sessions.SessionState{
-		User:        userName,
-		Email:       emailAddress,
-		AccessToken: "oauth_token",
-		CreatedAt:   &created,
-	}
-	{
-		rw := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", opts.ProxyPrefix+"/testCase0", nil)
-		proxy, err := NewOAuthProxy(opts, func(email string) bool {
-			return email == emailAddress
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		proxy.addHeadersForProxying(rw, req, session)
-		assert.Equal(t, expectedUserHeader, req.Header["Authorization"][0])
-		assert.Equal(t, userName, req.Header["X-Forwarded-User"][0])
-	}
-
-	opts.PreferEmailToUser = true
-	{
-		rw := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", opts.ProxyPrefix+"/testCase1", nil)
-
-		proxy, err := NewOAuthProxy(opts, func(email string) bool {
-			return email == emailAddress
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		proxy.addHeadersForProxying(rw, req, session)
-		assert.Equal(t, expectedEmailHeader, req.Header["Authorization"][0])
-		assert.Equal(t, emailAddress, req.Header["X-Forwarded-User"][0])
-	}
-}
-
-func TestPassUserHeadersWithEmail(t *testing.T) {
-	opts := baseTestOptions()
-	err := validation.Validate(opts)
-	assert.NoError(t, err)
-
-	const emailAddress = "john.doe@example.com"
-	const userName = "9fcab5c9b889a557"
-
-	created := time.Now()
-	session := &sessions.SessionState{
-		User:        userName,
-		Email:       emailAddress,
-		AccessToken: "oauth_token",
-		CreatedAt:   &created,
-	}
-	{
-		rw := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", opts.ProxyPrefix+"/testCase0", nil)
-		proxy, err := NewOAuthProxy(opts, func(email string) bool {
-			return email == emailAddress
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		proxy.addHeadersForProxying(rw, req, session)
-		assert.Equal(t, userName, req.Header["X-Forwarded-User"][0])
-	}
-
-	opts.PreferEmailToUser = true
-	{
-		rw := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", opts.ProxyPrefix+"/testCase1", nil)
-
-		proxy, err := NewOAuthProxy(opts, func(email string) bool {
-			return email == emailAddress
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		proxy.addHeadersForProxying(rw, req, session)
-		assert.Equal(t, emailAddress, req.Header["X-Forwarded-User"][0])
-	}
-}
-
 func TestPassGroupsHeadersWithGroups(t *testing.T) {
 	opts := baseTestOptions()
+	opts.InjectRequestHeaders = []options.Header{
+		{
+			Name: "X-Forwarded-Groups",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "groups",
+					},
+				},
+			},
+		},
+	}
+
 	err := validation.Validate(opts)
 	assert.NoError(t, err)
 
@@ -609,161 +597,27 @@ func TestPassGroupsHeadersWithGroups(t *testing.T) {
 		AccessToken: "oauth_token",
 		CreatedAt:   &created,
 	}
-	{
-		rw := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", opts.ProxyPrefix+"/testCase0", nil)
-		proxy, err := NewOAuthProxy(opts, func(email string) bool {
-			return email == emailAddress
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		proxy.addHeadersForProxying(rw, req, session)
-		assert.Equal(t, groups, req.Header["X-Forwarded-Groups"])
-	}
-}
 
-func TestStripAuthHeaders(t *testing.T) {
-	testCases := map[string]struct {
-		SkipAuthStripHeaders bool
-		PassBasicAuth        bool
-		PassUserHeaders      bool
-		PassAccessToken      bool
-		PassAuthorization    bool
-		StrippedHeaders      map[string]bool
-	}{
-		"Default options": {
-			SkipAuthStripHeaders: true,
-			PassBasicAuth:        true,
-			PassUserHeaders:      true,
-			PassAccessToken:      false,
-			PassAuthorization:    false,
-			StrippedHeaders: map[string]bool{
-				"X-Forwarded-User":               true,
-				"X-Forwared-Groups":              true,
-				"X-Forwarded-Email":              true,
-				"X-Forwarded-Preferred-Username": true,
-				"X-Forwarded-Access-Token":       false,
-				"Authorization":                  true,
-			},
-		},
-		"Pass access token": {
-			SkipAuthStripHeaders: true,
-			PassBasicAuth:        true,
-			PassUserHeaders:      true,
-			PassAccessToken:      true,
-			PassAuthorization:    false,
-			StrippedHeaders: map[string]bool{
-				"X-Forwarded-User":               true,
-				"X-Forwared-Groups":              true,
-				"X-Forwarded-Email":              true,
-				"X-Forwarded-Preferred-Username": true,
-				"X-Forwarded-Access-Token":       true,
-				"Authorization":                  true,
-			},
-		},
-		"Nothing setting Authorization": {
-			SkipAuthStripHeaders: true,
-			PassBasicAuth:        false,
-			PassUserHeaders:      true,
-			PassAccessToken:      true,
-			PassAuthorization:    false,
-			StrippedHeaders: map[string]bool{
-				"X-Forwarded-User":               true,
-				"X-Forwared-Groups":              true,
-				"X-Forwarded-Email":              true,
-				"X-Forwarded-Preferred-Username": true,
-				"X-Forwarded-Access-Token":       true,
-				"Authorization":                  false,
-			},
-		},
-		"Only Authorization header modified": {
-			SkipAuthStripHeaders: true,
-			PassBasicAuth:        false,
-			PassUserHeaders:      false,
-			PassAccessToken:      false,
-			PassAuthorization:    true,
-			StrippedHeaders: map[string]bool{
-				"X-Forwarded-User":               false,
-				"X-Forwared-Groups":              false,
-				"X-Forwarded-Email":              false,
-				"X-Forwarded-Preferred-Username": false,
-				"X-Forwarded-Access-Token":       false,
-				"Authorization":                  true,
-			},
-		},
-		"Don't strip any headers (default options)": {
-			SkipAuthStripHeaders: false,
-			PassBasicAuth:        true,
-			PassUserHeaders:      true,
-			PassAccessToken:      false,
-			PassAuthorization:    false,
-			StrippedHeaders: map[string]bool{
-				"X-Forwarded-User":               false,
-				"X-Forwared-Groups":              false,
-				"X-Forwarded-Email":              false,
-				"X-Forwarded-Preferred-Username": false,
-				"X-Forwarded-Access-Token":       false,
-				"Authorization":                  false,
-			},
-		},
-		"Don't strip any headers (custom options)": {
-			SkipAuthStripHeaders: false,
-			PassBasicAuth:        true,
-			PassUserHeaders:      true,
-			PassAccessToken:      true,
-			PassAuthorization:    false,
-			StrippedHeaders: map[string]bool{
-				"X-Forwarded-User":               false,
-				"X-Forwared-Groups":              false,
-				"X-Forwarded-Email":              false,
-				"X-Forwarded-Preferred-Username": false,
-				"X-Forwarded-Access-Token":       false,
-				"Authorization":                  false,
-			},
-		},
-	}
+	proxy, err := NewOAuthProxy(opts, func(email string) bool {
+		return email == emailAddress
+	})
+	assert.NoError(t, err)
 
-	initialHeaders := map[string]string{
-		"X-Forwarded-User":               "9fcab5c9b889a557",
-		"X-Forwarded-Email":              "john.doe@example.com",
-		"X-Forwarded-Groups":             "a,b,c",
-		"X-Forwarded-Preferred-Username": "john.doe",
-		"X-Forwarded-Access-Token":       "AccessToken",
-		"Authorization":                  "bearer IDToken",
-	}
+	// Save the required session
+	rw := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/", nil)
+	err = proxy.sessionStore.Save(rw, req, session)
+	assert.NoError(t, err)
 
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			opts := baseTestOptions()
-			opts.SkipAuthStripHeaders = tc.SkipAuthStripHeaders
-			opts.PassBasicAuth = tc.PassBasicAuth
-			opts.PassUserHeaders = tc.PassUserHeaders
-			opts.PassAccessToken = tc.PassAccessToken
-			opts.PassAuthorization = tc.PassAuthorization
-			err := validation.Validate(opts)
-			assert.NoError(t, err)
+	// Extract the cookie value to inject into the test request
+	cookie := rw.Header().Values("Set-Cookie")[0]
 
-			req, _ := http.NewRequest("GET", fmt.Sprintf("%s/testCase", opts.ProxyPrefix), nil)
-			for header, val := range initialHeaders {
-				req.Header.Set(header, val)
-			}
+	req, _ = http.NewRequest("GET", "/", nil)
+	req.Header.Set("Cookie", cookie)
+	rw = httptest.NewRecorder()
+	proxy.ServeHTTP(rw, req)
 
-			proxy, err := NewOAuthProxy(opts, func(_ string) bool { return true })
-			assert.NoError(t, err)
-			if proxy.skipAuthStripHeaders {
-				proxy.stripAuthHeaders(req)
-			}
-
-			for header, stripped := range tc.StrippedHeaders {
-				if stripped {
-					assert.Equal(t, req.Header.Get(header), "")
-				} else {
-					assert.Equal(t, req.Header.Get(header), initialHeaders[header])
-				}
-			}
-		})
-	}
+	assert.Equal(t, []string{"a,b"}, req.Header["X-Forwarded-Groups"])
 }
 
 type PassAccessTokenTest struct {
@@ -812,7 +666,21 @@ func NewPassAccessTokenTest(opts PassAccessTokenTestOptions) (*PassAccessTokenTe
 	}
 
 	patt.opts.Cookie.Secure = false
-	patt.opts.PassAccessToken = opts.PassAccessToken
+	if opts.PassAccessToken {
+		patt.opts.InjectRequestHeaders = []options.Header{
+			{
+				Name: "X-Forwarded-Access-Token",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim: "access_token",
+						},
+					},
+				},
+			},
+		}
+	}
+
 	err := validation.Validate(patt.opts)
 	if err != nil {
 		return nil, err
@@ -1115,8 +983,10 @@ func NewProcessCookieTest(opts ProcessCookieTestOpts, modifiers ...OptionsModifi
 		return nil, err
 	}
 	pcTest.proxy.provider = &TestProvider{
-		ValidToken: opts.providerValidateCookieResponse,
+		ProviderData: &providers.ProviderData{},
+		ValidToken:   opts.providerValidateCookieResponse,
 	}
+	pcTest.proxy.provider.(*TestProvider).SetAllowedGroups(pcTest.opts.AllowedGroups)
 
 	// Now, zero-out proxy.CookieRefresh for the cases that don't involve
 	// access_token validation.
@@ -1261,20 +1131,67 @@ func NewUserInfoEndpointTest() (*ProcessCookieTest, error) {
 }
 
 func TestUserInfoEndpointAccepted(t *testing.T) {
-	test, err := NewUserInfoEndpointTest()
-	if err != nil {
-		t.Fatal(err)
+	testCases := []struct {
+		name             string
+		session          *sessions.SessionState
+		expectedResponse string
+	}{
+		{
+			name: "Full session",
+			session: &sessions.SessionState{
+				User:        "john.doe",
+				Email:       "john.doe@example.com",
+				Groups:      []string{"example", "groups"},
+				AccessToken: "my_access_token",
+			},
+			expectedResponse: "{\"user\":\"john.doe\",\"email\":\"john.doe@example.com\",\"groups\":[\"example\",\"groups\"]}\n",
+		},
+		{
+			name: "Minimal session",
+			session: &sessions.SessionState{
+				User:   "john.doe",
+				Email:  "john.doe@example.com",
+				Groups: []string{"example", "groups"},
+			},
+			expectedResponse: "{\"user\":\"john.doe\",\"email\":\"john.doe@example.com\",\"groups\":[\"example\",\"groups\"]}\n",
+		},
+		{
+			name: "No groups",
+			session: &sessions.SessionState{
+				User:        "john.doe",
+				Email:       "john.doe@example.com",
+				AccessToken: "my_access_token",
+			},
+			expectedResponse: "{\"user\":\"john.doe\",\"email\":\"john.doe@example.com\"}\n",
+		},
+		{
+			name: "With Preferred Username",
+			session: &sessions.SessionState{
+				User:              "john.doe",
+				PreferredUsername: "john",
+				Email:             "john.doe@example.com",
+				Groups:            []string{"example", "groups"},
+				AccessToken:       "my_access_token",
+			},
+			expectedResponse: "{\"user\":\"john.doe\",\"email\":\"john.doe@example.com\",\"groups\":[\"example\",\"groups\"],\"preferredUsername\":\"john\"}\n",
+		},
 	}
 
-	startSession := &sessions.SessionState{
-		Email: "john.doe@example.com", AccessToken: "my_access_token"}
-	err = test.SaveSession(startSession)
-	assert.NoError(t, err)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			test, err := NewUserInfoEndpointTest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = test.SaveSession(tc.session)
+			assert.NoError(t, err)
 
-	test.proxy.ServeHTTP(test.rw, test.req)
-	assert.Equal(t, http.StatusOK, test.rw.Code)
-	bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
-	assert.Equal(t, "{\"email\":\"john.doe@example.com\"}\n", string(bodyBytes))
+			test.proxy.ServeHTTP(test.rw, test.req)
+			assert.Equal(t, http.StatusOK, test.rw.Code)
+			bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
+			assert.Equal(t, tc.expectedResponse, string(bodyBytes))
+		})
+	}
 }
 
 func TestUserInfoEndpointUnauthorizedOnNoCookieSetError(t *testing.T) {
@@ -1287,18 +1204,20 @@ func TestUserInfoEndpointUnauthorizedOnNoCookieSetError(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
 }
 
-func NewAuthOnlyEndpointTest(modifiers ...OptionsModifier) (*ProcessCookieTest, error) {
+func NewAuthOnlyEndpointTest(querystring string, modifiers ...OptionsModifier) (*ProcessCookieTest, error) {
 	pcTest, err := NewProcessCookieTestWithOptionsModifiers(modifiers...)
 	if err != nil {
 		return nil, err
 	}
-	pcTest.req, _ = http.NewRequest("GET",
-		pcTest.opts.ProxyPrefix+"/auth", nil)
+	pcTest.req, _ = http.NewRequest(
+		"GET",
+		fmt.Sprintf("%s/auth%s", pcTest.opts.ProxyPrefix, querystring),
+		nil)
 	return pcTest, nil
 }
 
 func TestAuthOnlyEndpointAccepted(t *testing.T) {
-	test, err := NewAuthOnlyEndpointTest()
+	test, err := NewAuthOnlyEndpointTest("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1316,7 +1235,7 @@ func TestAuthOnlyEndpointAccepted(t *testing.T) {
 }
 
 func TestAuthOnlyEndpointUnauthorizedOnNoCookieSetError(t *testing.T) {
-	test, err := NewAuthOnlyEndpointTest()
+	test, err := NewAuthOnlyEndpointTest("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1324,11 +1243,11 @@ func TestAuthOnlyEndpointUnauthorizedOnNoCookieSetError(t *testing.T) {
 	test.proxy.ServeHTTP(test.rw, test.req)
 	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
 	bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
-	assert.Equal(t, "unauthorized request\n", string(bodyBytes))
+	assert.Equal(t, "Unauthorized\n", string(bodyBytes))
 }
 
 func TestAuthOnlyEndpointUnauthorizedOnExpiration(t *testing.T) {
-	test, err := NewAuthOnlyEndpointTest(func(opts *options.Options) {
+	test, err := NewAuthOnlyEndpointTest("", func(opts *options.Options) {
 		opts.Cookie.Expire = time.Duration(24) * time.Hour
 	})
 	if err != nil {
@@ -1344,11 +1263,11 @@ func TestAuthOnlyEndpointUnauthorizedOnExpiration(t *testing.T) {
 	test.proxy.ServeHTTP(test.rw, test.req)
 	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
 	bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
-	assert.Equal(t, "unauthorized request\n", string(bodyBytes))
+	assert.Equal(t, "Unauthorized\n", string(bodyBytes))
 }
 
 func TestAuthOnlyEndpointUnauthorizedOnEmailValidationFailure(t *testing.T) {
-	test, err := NewAuthOnlyEndpointTest()
+	test, err := NewAuthOnlyEndpointTest("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1363,14 +1282,55 @@ func TestAuthOnlyEndpointUnauthorizedOnEmailValidationFailure(t *testing.T) {
 	test.proxy.ServeHTTP(test.rw, test.req)
 	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
 	bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
-	assert.Equal(t, "unauthorized request\n", string(bodyBytes))
+	assert.Equal(t, "Unauthorized\n", string(bodyBytes))
 }
 
 func TestAuthOnlyEndpointSetXAuthRequestHeaders(t *testing.T) {
 	var pcTest ProcessCookieTest
 
 	pcTest.opts = baseTestOptions()
-	pcTest.opts.SetXAuthRequest = true
+	pcTest.opts.InjectResponseHeaders = []options.Header{
+		{
+			Name: "X-Auth-Request-User",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "user",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Auth-Request-Email",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "email",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Auth-Request-Groups",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "groups",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Forwarded-Preferred-Username",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "preferred_username",
+					},
+				},
+			},
+		},
+	}
 	pcTest.opts.AllowedGroups = []string{"oauth_groups"}
 	err := validation.Validate(pcTest.opts)
 	assert.NoError(t, err)
@@ -1382,7 +1342,8 @@ func TestAuthOnlyEndpointSetXAuthRequestHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	pcTest.proxy.provider = &TestProvider{
-		ValidToken: true,
+		ProviderData: &providers.ProviderData{},
+		ValidToken:   true,
 	}
 
 	pcTest.validateUser = true
@@ -1408,8 +1369,62 @@ func TestAuthOnlyEndpointSetBasicAuthTrueRequestHeaders(t *testing.T) {
 	var pcTest ProcessCookieTest
 
 	pcTest.opts = baseTestOptions()
-	pcTest.opts.SetXAuthRequest = true
-	pcTest.opts.SetBasicAuth = true
+	pcTest.opts.InjectResponseHeaders = []options.Header{
+		{
+			Name: "X-Auth-Request-User",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "user",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Auth-Request-Email",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "email",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Auth-Request-Groups",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "groups",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Forwarded-Preferred-Username",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "preferred_username",
+					},
+				},
+			},
+		},
+		{
+			Name: "Authorization",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "user",
+						BasicAuthPassword: &options.SecretSource{
+							Value: []byte("This is a secure password"),
+						},
+					},
+				},
+			},
+		},
+	}
+
 	err := validation.Validate(pcTest.opts)
 	assert.NoError(t, err)
 
@@ -1420,7 +1435,8 @@ func TestAuthOnlyEndpointSetBasicAuthTrueRequestHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	pcTest.proxy.provider = &TestProvider{
-		ValidToken: true,
+		ProviderData: &providers.ProviderData{},
+		ValidToken:   true,
 	}
 
 	pcTest.validateUser = true
@@ -1439,7 +1455,7 @@ func TestAuthOnlyEndpointSetBasicAuthTrueRequestHeaders(t *testing.T) {
 	assert.Equal(t, http.StatusAccepted, pcTest.rw.Code)
 	assert.Equal(t, "oauth_user", pcTest.rw.Header().Values("X-Auth-Request-User")[0])
 	assert.Equal(t, "oauth_user@example.com", pcTest.rw.Header().Values("X-Auth-Request-Email")[0])
-	expectedHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte("oauth_user:"+pcTest.opts.BasicAuthPassword))
+	expectedHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte("oauth_user:This is a secure password"))
 	assert.Equal(t, expectedHeader, pcTest.rw.Header().Values("Authorization")[0])
 }
 
@@ -1447,8 +1463,48 @@ func TestAuthOnlyEndpointSetBasicAuthFalseRequestHeaders(t *testing.T) {
 	var pcTest ProcessCookieTest
 
 	pcTest.opts = baseTestOptions()
-	pcTest.opts.SetXAuthRequest = true
-	pcTest.opts.SetBasicAuth = false
+	pcTest.opts.InjectResponseHeaders = []options.Header{
+		{
+			Name: "X-Auth-Request-User",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "user",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Auth-Request-Email",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "email",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Auth-Request-Groups",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "groups",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Forwarded-Preferred-Username",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "preferred_username",
+					},
+				},
+			},
+		},
+	}
 	err := validation.Validate(pcTest.opts)
 	assert.NoError(t, err)
 
@@ -1459,7 +1515,8 @@ func TestAuthOnlyEndpointSetBasicAuthFalseRequestHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	pcTest.proxy.provider = &TestProvider{
-		ValidToken: true,
+		ProviderData: &providers.ProviderData{},
+		ValidToken:   true,
 	}
 
 	pcTest.validateUser = true
@@ -1698,8 +1755,9 @@ func TestRequestSignature(t *testing.T) {
 	}
 }
 
-func TestGetRedirect(t *testing.T) {
+func Test_getAppRedirect(t *testing.T) {
 	opts := baseTestOptions()
+	opts.WhitelistDomains = append(opts.WhitelistDomains, ".example.com", ".example.com:8443")
 	err := validation.Validate(opts)
 	assert.NoError(t, err)
 	require.NotEmpty(t, opts.ProxyPrefix)
@@ -1711,28 +1769,144 @@ func TestGetRedirect(t *testing.T) {
 	tests := []struct {
 		name             string
 		url              string
+		headers          map[string]string
+		reverseProxy     bool
 		expectedRedirect string
 	}{
 		{
 			name:             "request outside of ProxyPrefix redirects to original URL",
 			url:              "/foo/bar",
+			headers:          nil,
+			reverseProxy:     false,
 			expectedRedirect: "/foo/bar",
 		},
 		{
 			name:             "request with query preserves query",
 			url:              "/foo?bar",
+			headers:          nil,
+			reverseProxy:     false,
 			expectedRedirect: "/foo?bar",
 		},
 		{
 			name:             "request under ProxyPrefix redirects to root",
 			url:              proxy.ProxyPrefix + "/foo/bar",
+			headers:          nil,
+			reverseProxy:     false,
 			expectedRedirect: "/",
+		},
+		{
+			name: "proxied request outside of ProxyPrefix redirects to proxied URL",
+			url:  "https://oauth.example.com/foo/bar",
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https",
+				"X-Forwarded-Host":  "a-service.example.com",
+				"X-Forwarded-Uri":   "/foo/bar",
+			},
+			reverseProxy:     true,
+			expectedRedirect: "https://a-service.example.com/foo/bar",
+		},
+		{
+			name: "non-proxied request with spoofed proxy headers wouldn't redirect",
+			url:  "https://oauth.example.com/foo?bar",
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https",
+				"X-Forwarded-Host":  "a-service.example.com",
+				"X-Forwarded-Uri":   "/foo/bar",
+			},
+			reverseProxy:     false,
+			expectedRedirect: "/foo?bar",
+		},
+		{
+			name: "proxied request under ProxyPrefix redirects to root",
+			url:  "https://oauth.example.com" + proxy.ProxyPrefix + "/foo/bar",
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https",
+				"X-Forwarded-Host":  "a-service.example.com",
+				"X-Forwarded-Uri":   proxy.ProxyPrefix + "/foo/bar",
+			},
+			reverseProxy:     true,
+			expectedRedirect: "https://a-service.example.com/",
+		},
+		{
+			name: "proxied request with port under ProxyPrefix redirects to root",
+			url:  "https://oauth.example.com" + proxy.ProxyPrefix + "/foo/bar",
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https",
+				"X-Forwarded-Host":  "a-service.example.com:8443",
+				"X-Forwarded-Uri":   proxy.ProxyPrefix + "/foo/bar",
+			},
+			reverseProxy:     true,
+			expectedRedirect: "https://a-service.example.com:8443/",
+		},
+		{
+			name: "proxied request with missing uri header would still redirect to desired redirect",
+			url:  "https://oauth.example.com/foo?bar",
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https",
+				"X-Forwarded-Host":  "a-service.example.com",
+			},
+			reverseProxy:     true,
+			expectedRedirect: "https://a-service.example.com/foo?bar",
+		},
+		{
+			name:             "request with headers proxy not being set (and reverse proxy enabled) would still redirect to desired redirect",
+			url:              "https://oauth.example.com/foo?bar",
+			headers:          nil,
+			reverseProxy:     true,
+			expectedRedirect: "/foo?bar",
+		},
+		{
+			name: "proxied request with X-Auth-Request-Redirect being set outside of ProxyPrefix redirects to proxied URL",
+			url:  "https://oauth.example.com/foo/bar",
+			headers: map[string]string{
+				"X-Auth-Request-Redirect": "https://a-service.example.com/foo/bar",
+			},
+			reverseProxy:     true,
+			expectedRedirect: "https://a-service.example.com/foo/bar",
+		},
+		{
+			name:             "proxied request with rd query string redirects to proxied URL",
+			url:              "https://oauth.example.com/foo/bar?rd=https%3A%2F%2Fa%2Dservice%2Eexample%2Ecom%2Ffoo%2Fbar",
+			headers:          nil,
+			reverseProxy:     false,
+			expectedRedirect: "https://a-service.example.com/foo/bar",
+		},
+		{
+			name: "proxied request with rd query string and all headers set (and reverse proxy not enabled) redirects to proxied URL on rd query string",
+			url:  "https://oauth.example.com/foo/bar?rd=https%3A%2F%2Fa%2Dservice%2Eexample%2Ecom%2Ffoo%2Fjazz",
+			headers: map[string]string{
+				"X-Auth-Request-Redirect": "https://a-service.example.com/foo/baz",
+				"X-Forwarded-Proto":       "http",
+				"X-Forwarded-Host":        "another-service.example.com",
+				"X-Forwarded-Uri":         "/seasons/greetings",
+			},
+			reverseProxy:     false,
+			expectedRedirect: "https://a-service.example.com/foo/jazz",
+		},
+		{
+			name: "proxied request with rd query string and some headers set redirects to proxied URL on rd query string",
+			url:  "https://oauth.example.com/foo/bar?rd=https%3A%2F%2Fa%2Dservice%2Eexample%2Ecom%2Ffoo%2Fbaz",
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https",
+				"X-Forwarded-Host":  "another-service.example.com",
+				"X-Forwarded-Uri":   "/seasons/greetings",
+			},
+			reverseProxy:     true,
+			expectedRedirect: "https://a-service.example.com/foo/baz",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req, _ := http.NewRequest("GET", tt.url, nil)
-			redirect, err := proxy.GetRedirect(req)
+			for header, value := range tt.headers {
+				if value != "" {
+					req.Header.Add(header, value)
+				}
+			}
+			req = middleware.AddRequestScope(req, &middleware.RequestScope{
+				ReverseProxy: tt.reverseProxy,
+			})
+			redirect, err := proxy.getAppRedirect(req)
 
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expectedRedirect, redirect)
@@ -1796,6 +1970,13 @@ func TestAjaxUnauthorizedRequest1(t *testing.T) {
 func TestAjaxUnauthorizedRequest2(t *testing.T) {
 	header := make(http.Header)
 	header.Add("Accept", applicationJSON)
+
+	testAjaxUnauthorizedRequest(t, header)
+}
+
+func TestAjaxUnauthorizedRequestAccept1(t *testing.T) {
+	header := make(http.Header)
+	header.Add("Accept", "application/json, text/plain, */*")
 
 	testAjaxUnauthorizedRequest(t, header)
 }
@@ -1883,7 +2064,7 @@ func TestClearSingleCookie(t *testing.T) {
 type NoOpKeySet struct {
 }
 
-func (NoOpKeySet) VerifySignature(ctx context.Context, jwt string) (payload []byte, err error) {
+func (NoOpKeySet) VerifySignature(_ context.Context, jwt string) (payload []byte, err error) {
 	splitStrings := strings.Split(jwt, ".")
 	payloadString := splitStrings[1]
 	return base64.RawURLEncoding.DecodeString(payloadString)
@@ -1912,10 +2093,74 @@ func TestGetJwtSession(t *testing.T) {
 	verifier := oidc.NewVerifier("https://issuer.example.com", keyset,
 		&oidc.Config{ClientID: "https://test.myapp.com", SkipExpiryCheck: true})
 
-	test, err := NewAuthOnlyEndpointTest(func(opts *options.Options) {
-		opts.PassAuthorization = true
-		opts.SetAuthorization = true
-		opts.SetXAuthRequest = true
+	test, err := NewAuthOnlyEndpointTest("", func(opts *options.Options) {
+		opts.InjectRequestHeaders = []options.Header{
+			{
+				Name: "Authorization",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim:  "id_token",
+							Prefix: "Bearer ",
+						},
+					},
+				},
+			},
+			{
+				Name: "X-Forwarded-User",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim: "user",
+						},
+					},
+				},
+			},
+			{
+				Name: "X-Forwarded-Email",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim: "email",
+						},
+					},
+				},
+			},
+		}
+
+		opts.InjectResponseHeaders = []options.Header{
+			{
+				Name: "Authorization",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim:  "id_token",
+							Prefix: "Bearer ",
+						},
+					},
+				},
+			},
+			{
+				Name: "X-Auth-Request-User",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim: "user",
+						},
+					},
+				},
+			},
+			{
+				Name: "X-Auth-Request-Email",
+				Values: []options.HeaderValue{
+					{
+						ClaimSource: &options.ClaimSource{
+							Claim: "email",
+						},
+					},
+				},
+			},
+		}
 		opts.SkipJwtBearerTokens = true
 		opts.SetJWTBearerVerifiers(append(opts.GetJWTBearerVerifiers(), verifier))
 	})
@@ -1931,15 +2176,6 @@ func TestGetJwtSession(t *testing.T) {
 	test.req.Header = map[string][]string{
 		"Authorization": {authHeader},
 	}
-
-	// Bearer
-	expires := time.Unix(1912151821, 0)
-	session, err := test.proxy.getAuthenticatedSession(test.rw, test.req)
-	assert.NoError(t, err)
-	assert.Equal(t, session.User, "1234567890")
-	assert.Equal(t, session.Email, "john@example.com")
-	assert.Equal(t, session.ExpiresOn, &expires)
-	assert.Equal(t, session.IDToken, goodJwt)
 
 	test.proxy.ServeHTTP(test.rw, test.req)
 	if test.rw.Code >= 400 {
@@ -2068,6 +2304,44 @@ func baseTestOptions() *options.Options {
 	opts.ClientID = clientID
 	opts.ClientSecret = clientSecret
 	opts.EmailDomains = []string{"*"}
+
+	// Default injected headers for legacy configuration
+	opts.InjectRequestHeaders = []options.Header{
+		{
+			Name: "Authorization",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "user",
+						BasicAuthPassword: &options.SecretSource{
+							Value: []byte(base64.StdEncoding.EncodeToString([]byte("This is a secure password"))),
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Forwarded-User",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "user",
+					},
+				},
+			},
+		},
+		{
+			Name: "X-Forwarded-Email",
+			Values: []options.HeaderValue{
+				{
+					ClaimSource: &options.ClaimSource{
+						Claim: "email",
+					},
+				},
+			},
+		},
+	}
+
 	return opts
 }
 
@@ -2542,7 +2816,7 @@ func TestProxyAllowedGroups(t *testing.T) {
 			test.proxy.ServeHTTP(test.rw, test.req)
 
 			if tt.expectUnauthorized {
-				assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
+				assert.Equal(t, http.StatusForbidden, test.rw.Code)
 			} else {
 				assert.Equal(t, http.StatusOK, test.rw.Code)
 			}
@@ -2551,32 +2825,106 @@ func TestProxyAllowedGroups(t *testing.T) {
 }
 
 func TestAuthOnlyAllowedGroups(t *testing.T) {
-	tests := []struct {
+	testCases := []struct {
 		name               string
 		allowedGroups      []string
 		groups             []string
-		expectUnauthorized bool
+		querystring        string
+		expectedStatusCode int
 	}{
-		{"NoAllowedGroups", []string{}, []string{}, false},
-		{"NoAllowedGroupsUserHasGroups", []string{}, []string{"a", "b"}, false},
-		{"UserInAllowedGroup", []string{"a"}, []string{"a", "b"}, false},
-		{"UserNotInAllowedGroup", []string{"a"}, []string{"c"}, true},
+		{
+			name:               "NoAllowedGroups",
+			allowedGroups:      []string{},
+			groups:             []string{},
+			querystring:        "",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "NoAllowedGroupsUserHasGroups",
+			allowedGroups:      []string{},
+			groups:             []string{"a", "b"},
+			querystring:        "",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "UserInAllowedGroup",
+			allowedGroups:      []string{"a"},
+			groups:             []string{"a", "b"},
+			querystring:        "",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "UserNotInAllowedGroup",
+			allowedGroups:      []string{"a"},
+			groups:             []string{"c"},
+			querystring:        "",
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name:               "UserInQuerystringGroup",
+			allowedGroups:      []string{"a", "b"},
+			groups:             []string{"a", "c"},
+			querystring:        "?allowed_groups=a",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "UserInMultiParamQuerystringGroup",
+			allowedGroups:      []string{"a", "b"},
+			groups:             []string{"b"},
+			querystring:        "?allowed_groups=a&allowed_groups=b,d",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "UserInOnlyQuerystringGroup",
+			allowedGroups:      []string{},
+			groups:             []string{"a", "c"},
+			querystring:        "?allowed_groups=a,b",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "UserInDelimitedQuerystringGroup",
+			allowedGroups:      []string{"a", "b", "c"},
+			groups:             []string{"c"},
+			querystring:        "?allowed_groups=a,c",
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:               "UserNotInQuerystringGroup",
+			allowedGroups:      []string{},
+			groups:             []string{"c"},
+			querystring:        "?allowed_groups=a,b",
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			name:               "UserInConfigGroupNotInQuerystringGroup",
+			allowedGroups:      []string{"a", "b", "c"},
+			groups:             []string{"c"},
+			querystring:        "?allowed_groups=a,b",
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			name:               "UserInQuerystringGroupNotInConfigGroup",
+			allowedGroups:      []string{"a", "b"},
+			groups:             []string{"c"},
+			querystring:        "?allowed_groups=b,c",
+			expectedStatusCode: http.StatusUnauthorized,
+		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
 			emailAddress := "test"
 			created := time.Now()
 
 			session := &sessions.SessionState{
-				Groups:      tt.groups,
+				Groups:      tc.groups,
 				Email:       emailAddress,
 				AccessToken: "oauth_token",
 				CreatedAt:   &created,
 			}
 
-			test, err := NewAuthOnlyEndpointTest(func(opts *options.Options) {
-				opts.AllowedGroups = tt.allowedGroups
+			test, err := NewAuthOnlyEndpointTest(tc.querystring, func(opts *options.Options) {
+				opts.AllowedGroups = tc.allowedGroups
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -2587,11 +2935,7 @@ func TestAuthOnlyAllowedGroups(t *testing.T) {
 
 			test.proxy.ServeHTTP(test.rw, test.req)
 
-			if tt.expectUnauthorized {
-				assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
-			} else {
-				assert.Equal(t, http.StatusAccepted, test.rw.Code)
-			}
+			assert.Equal(t, tc.expectedStatusCode, test.rw.Code)
 		})
 	}
 }
